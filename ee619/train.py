@@ -71,7 +71,7 @@ def main(domain: str,
     policy = Policy(observation_shape, action_shape)
     policy_optimizer = Adam(policy.parameters(), lr=learning_rate)
     critic = Critic(observation_shape)
-    critic_optimizer = Adam(critic.parameters(), lr=learning_rate)
+    critic_optimizer = Adam(critic.parameters(), lr=learning_rate/2)
     policy.train()
     critic.train()
 
@@ -89,8 +89,8 @@ def main(domain: str,
           gamma=gamma,
           map_action=map_action,
           num_episodes=num_episodes,
-          num_episodes_per_update=5,
-          num_epochs=5,
+          num_episodes_per_update=20,
+          num_epochs=4,
           clip=0.2,
           policy_optimizer=policy_optimizer,
           critic_optimizer=critic_optimizer,
@@ -202,13 +202,15 @@ def train(
                 surr1 = ratios * A
                 surr2 = torch.clamp(ratios, 1 - clip, 1 + clip) * A
                 actor_loss = (-torch.min(surr1, surr2)).mean()
-                critic_loss = nn.MSELoss()(V, batch_returns)
 
                 #policy update
                 policy_optimizer.zero_grad()
                 actor_loss.backward(retain_graph=True)
                 policy_optimizer.step()
+                
                 #critic update
+                critic_loss = nn.HuberLoss()(V.squeeze(), batch_returns)
+
                 critic_optimizer.zero_grad()
                 critic_loss.backward()
                 critic_optimizer.step()
@@ -263,7 +265,7 @@ def rollout(env: Environment,
     while not time_step.last():
         observation = flatten_and_concat(time_step.observation)
         observations.append(observation.copy())
-        action, log_prob = policy.act(observation)
+        action, log_prob = policy.act_with_prob(observation)
         actions.append(action.copy())
         log_probs.append(log_prob)
         time_step = env.step(map_action(action))
@@ -292,7 +294,7 @@ def build_argument_parser() -> ArgumentParser:
     parser.add_argument('--domain', default='walker')
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--learning-rate', type=float, default=5e-4)
-    parser.add_argument('--num-episodes', type=int, default=int(1e4))
+    parser.add_argument('--num-episodes', type=int, default=int(5e4))
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--task', default='run')
     parser.add_argument('--test-every', type=int, default=1000)

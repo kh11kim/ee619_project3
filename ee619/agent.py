@@ -84,6 +84,12 @@ class Policy(Net):
         mean = self(to_tensor(observation).unsqueeze(0))
         dist = MultivariateNormal(mean, self.cov_mat)
         action = dist.sample()
+        return action.squeeze(0).cpu().numpy()
+    
+    def act_with_prob(self, observation):
+        mean = self(to_tensor(observation).unsqueeze(0))
+        dist = MultivariateNormal(mean, self.cov_mat)
+        action = dist.sample()
         log_prob = dist.log_prob(action)
         return action.squeeze(0).cpu().numpy(), log_prob.item()
 
