@@ -1,18 +1,20 @@
 from argparse import ArgumentParser
-from locale import currency
 import numpy as np
-from dm_control import suite
-from dm_control.rl.control import Environment
-from typing import Callable, Iterable, List, NamedTuple, Optional
 import operator
+from tqdm import trange
 from functools import reduce
+from typing import Callable, Iterable, List, NamedTuple, Optional
+
 import torch
 import torch.nn as nn
 from torch.optim import Adam
 from torch.distributions import MultivariateNormal
 from torch.utils.tensorboard.writer import SummaryWriter
+from dm_control import suite
+from dm_control.rl.control import Environment
+
 from agent import flatten_and_concat, Policy, to_tensor, Critic
-from tqdm import trange
+
 
 class Trajectory(NamedTuple):
     """Class to manage trajectory samples."""
@@ -21,24 +23,10 @@ class Trajectory(NamedTuple):
     log_probs: torch.Tensor
     returns: torch.Tensor
 
-def build_argument_parser() -> ArgumentParser:
-    """Returns an argument parser for main."""
-    parser = ArgumentParser()
-    parser.add_argument('save_path')
-    parser.add_argument('-q', action='store_false', dest='log')
-    parser.add_argument('--domain', default='walker')
-    parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--learning-rate', type=float, default=5e-4)
-    parser.add_argument('--num-episodes', type=int, default=int(5e4))
-    parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--task', default='run')
-    parser.add_argument('--test-every', type=int, default=1000)
-    parser.add_argument('--test-num', type=int, default=10)
-    return parser
-
 def product(iterable: Iterable[int]) -> int:
     """Return the product of every element in iterable."""
     return reduce(operator.mul, iterable, 1)
+
 
 def main(domain: str,
          gamma: float,
@@ -81,15 +69,12 @@ def main(domain: str,
         return np.tanh(input_) * scale_action + loc_action
 
     policy = Policy(observation_shape, action_shape)
+    policy_optimizer = Adam(policy.parameters(), lr=learning_rate)
     critic = Critic(observation_shape)
+    critic_optimizer = Adam(critic.parameters(), lr=learning_rate)
     policy.train()
     critic.train()
-    policy_optimizer = Adam(policy.parameters(), lr=learning_rate)
-    critic_optimizer = Adam(critic.parameters(), lr=learning_rate)
 
-    # #test rollout
-    # trajectory = rollout(env=env, gamma=gamma,
-    #                      map_action=map_action, policy=policy)
     def test_function(episode: int):
         test(domain=domain,
              episode=episode,
@@ -104,6 +89,9 @@ def main(domain: str,
           gamma=gamma,
           map_action=map_action,
           num_episodes=num_episodes,
+          num_episodes_per_update=5,
+          num_epochs=5,
+          clip=0.2,
           policy_optimizer=policy_optimizer,
           critic_optimizer=critic_optimizer,
           policy=policy,
@@ -151,18 +139,23 @@ def test(domain: str,
         writer.add_scalar('test/mean', np.mean(returns), episode)
         writer.add_scalar('test/stddev', np.std(returns), episode)
 
-def train(env: Environment,
-          gamma: float,
-          map_action: Callable[[np.ndarray], np.ndarray],
-          num_episodes: int,
-          policy_optimizer: Adam,
-          critic_optimizer: Adam,
-          policy: Policy,
-          critic: Critic,
-          test_every: int,
-          test_function: Callable[[int], None],
-          writer: Optional[SummaryWriter]) -> None:
-    """Train the policy using the REINFORCE algorithm on the given environment.
+def train(
+    env: Environment,
+    gamma: float,
+    map_action: Callable[[np.ndarray], np.ndarray],
+    num_episodes: int,
+    num_episodes_per_update: int,
+    num_epochs: int, 
+    clip: float,
+    policy_optimizer: Adam,
+    critic_optimizer: Adam,
+    policy: Policy,
+    critic: Critic,
+    test_every: int,
+    test_function: Callable[[int], None],
+    writer: Optional[SummaryWriter]
+) -> None:
+    """Train the policy using the PPO algorithm on the given environment.
 
     Args:
         env: environment to train the policy
@@ -177,7 +170,6 @@ def train(env: Environment,
             it takes the current episode number as its argument.
         writer: tensorboard logger. if set to None, it does not log
     """
-    #rollout
     batch_obs = []
     batch_actions = []
     batch_returns = []
@@ -185,36 +177,36 @@ def train(env: Environment,
     for episode in trange(num_episodes):
         traj = rollout(
             env=env, gamma=gamma,
-            map_action=map_action, policy=policy
+            map_action=map_action, 
+            policy=policy
         )
         batch_obs.append(traj.observations)
         batch_actions.append(traj.actions)
         batch_returns.append(traj.returns)
         batch_log_probs.append(traj.log_probs)
 
-        if episode % 5 == 0:
+        if episode % num_episodes_per_update == 0:
             batch_obs = torch.concat(batch_obs)
             batch_actions = torch.concat(batch_actions)
             batch_returns = torch.concat(batch_returns)
             batch_log_probs = torch.concat(batch_log_probs)
             
-            batch_values = critic(batch_obs)
-            advantages = batch_returns - batch_values.detach()
-            #normalize
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-10)
+            V, _ = evaluate(batch_obs, batch_actions, policy, critic)
+            A = batch_returns - V.detach()
+            A = (A - A.mean()) / (A.std() + 1e-10) #normalize trick
 
             #epoch
-            for _ in range(5):
+            for _ in range(num_epochs):
                 V, log_probs_curr = evaluate(batch_obs, batch_actions, policy, critic)
                 ratios = torch.exp(log_probs_curr - batch_log_probs)
-                surr1 = ratios * advantages
-                surr2 = torch.clamp(ratios, 1 - 0.2, 1+0.2) * advantages
+                surr1 = ratios * A
+                surr2 = torch.clamp(ratios, 1 - clip, 1 + clip) * A
                 actor_loss = (-torch.min(surr1, surr2)).mean()
                 critic_loss = nn.MSELoss()(V, batch_returns)
 
                 #policy update
                 policy_optimizer.zero_grad()
-                actor_loss.backward()
+                actor_loss.backward(retain_graph=True)
                 policy_optimizer.step()
                 #critic update
                 critic_optimizer.zero_grad()
@@ -227,20 +219,16 @@ def train(env: Environment,
                 writer.add_scalar('train/policy_loss', actor_loss.item(), episode)
                 writer.add_scalar('train/critic_loss', critic_loss.item(), episode)
 
-            if episode % test_every == test_every - 1:
-                policy.eval()
-                test_function(episode)
-                policy.train()
-
             #init
             batch_obs = []
             batch_actions = []
             batch_returns = []
             batch_log_probs = []
 
-        
-            
-            
+        if episode % test_every == test_every - 1:
+            policy.eval()
+            test_function(episode)
+            policy.train()
 
 def evaluate(batch_obs, batch_actions, policy:Policy, critic:Critic):
     mean = policy(batch_obs)
@@ -295,6 +283,21 @@ def rollout(env: Environment,
         log_prob_batch,
         returns_batch
     )
+
+def build_argument_parser() -> ArgumentParser:
+    """Returns an argument parser for main."""
+    parser = ArgumentParser()
+    parser.add_argument('save_path')
+    parser.add_argument('-q', action='store_false', dest='log')
+    parser.add_argument('--domain', default='walker')
+    parser.add_argument('--gamma', type=float, default=0.99)
+    parser.add_argument('--learning-rate', type=float, default=5e-4)
+    parser.add_argument('--num-episodes', type=int, default=int(1e4))
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--task', default='run')
+    parser.add_argument('--test-every', type=int, default=1000)
+    parser.add_argument('--test-num', type=int, default=10)
+    return parser
 
 if __name__ == '__main__':
     main(**vars(build_argument_parser().parse_args()))    
