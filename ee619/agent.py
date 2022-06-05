@@ -13,7 +13,7 @@ from torch.distributions import MultivariateNormal
 ROOT = dirname(abspath(realpath(__file__)))  # path to the ee619 directory
 STATE_DIM = 24
 ACTION_DIM = 6
-NUM_HIDDEN_LAYER = 128
+NUM_HIDDEN_LAYER = 64
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 def flatten_and_concat(dmc_observation: Dict[str, np.ndarray]) -> np.ndarray:
@@ -59,9 +59,9 @@ class Net(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_features, hidden_layer),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(hidden_layer, hidden_layer),
-            nn.ReLU(),
+            nn.Tanh(),
             nn.Linear(hidden_layer, out_features)
         )
         self.to(device)

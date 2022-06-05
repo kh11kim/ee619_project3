@@ -71,7 +71,7 @@ def main(domain: str,
     policy = Policy(observation_shape, action_shape)
     policy_optimizer = Adam(policy.parameters(), lr=learning_rate)
     critic = Critic(observation_shape)
-    critic_optimizer = Adam(critic.parameters(), lr=learning_rate/2)
+    critic_optimizer = Adam(critic.parameters(), lr=learning_rate)
     policy.train()
     critic.train()
 
@@ -89,8 +89,8 @@ def main(domain: str,
           gamma=gamma,
           map_action=map_action,
           num_episodes=num_episodes,
-          num_episodes_per_update=20,
-          num_epochs=4,
+          num_episodes_per_update=4,
+          num_epochs=80,
           clip=0.2,
           policy_optimizer=policy_optimizer,
           critic_optimizer=critic_optimizer,
@@ -190,15 +190,20 @@ def train(
             batch_actions = torch.concat(batch_actions)
             batch_returns = torch.concat(batch_returns)
             batch_log_probs = torch.concat(batch_log_probs)
+            #normalize returns
+            batch_returns_norm = (batch_returns - batch_returns.mean())/(batch_returns.std()+1e-10)
             
-            V, _ = evaluate(batch_obs, batch_actions, policy, critic)
-            A = batch_returns - V.detach()
-            A = (A - A.mean()) / (A.std() + 1e-10) #normalize trick
+            # V, _ = evaluate(batch_obs, batch_actions, policy, critic)
+            # A = batch_returns - V.detach()
+            # A = (A - A.mean()) / (A.std() + 1e-10) #normalize trick
 
             #epoch
             for _ in range(num_epochs):
                 V, log_probs_curr = evaluate(batch_obs, batch_actions, policy, critic)
+                V = V.squeeze()
+
                 ratios = torch.exp(log_probs_curr - batch_log_probs)
+                A = batch_returns_norm - V.detach()
                 surr1 = ratios * A
                 surr2 = torch.clamp(ratios, 1 - clip, 1 + clip) * A
                 actor_loss = (-torch.min(surr1, surr2)).mean()
@@ -209,7 +214,7 @@ def train(
                 policy_optimizer.step()
                 
                 #critic update
-                critic_loss = nn.HuberLoss()(V.squeeze(), batch_returns)
+                critic_loss = nn.HuberLoss()(V, batch_returns_norm)
 
                 critic_optimizer.zero_grad()
                 critic_loss.backward()
@@ -265,7 +270,8 @@ def rollout(env: Environment,
     while not time_step.last():
         observation = flatten_and_concat(time_step.observation)
         observations.append(observation.copy())
-        action, log_prob = policy.act_with_prob(observation)
+        with torch.no_grad():
+            action, log_prob = policy.act_with_prob(observation)
         actions.append(action.copy())
         log_probs.append(log_prob)
         time_step = env.step(map_action(action))
@@ -293,7 +299,7 @@ def build_argument_parser() -> ArgumentParser:
     parser.add_argument('-q', action='store_false', dest='log')
     parser.add_argument('--domain', default='walker')
     parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--learning-rate', type=float, default=5e-4)
+    parser.add_argument('--learning-rate', type=float, default=1e-3)
     parser.add_argument('--num-episodes', type=int, default=int(5e4))
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--task', default='run')
