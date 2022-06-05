@@ -9,10 +9,12 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import MultivariateNormal
 
+
 ROOT = dirname(abspath(realpath(__file__)))  # path to the ee619 directory
 STATE_DIM = 24
 ACTION_DIM = 6
 NUM_HIDDEN_LAYER = 128
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 def flatten_and_concat(dmc_observation: Dict[str, np.ndarray]) -> np.ndarray:
     """Convert a DMControl observation (OrderedDict of NumPy arrays)
@@ -24,7 +26,7 @@ def flatten_and_concat(dmc_observation: Dict[str, np.ndarray]) -> np.ndarray:
 
 def to_tensor(array: np.ndarray) -> torch.Tensor:
     """Convert NumPy array to a PyTorch Tensor of data type torch.float32"""
-    return torch.as_tensor(array, dtype=torch.float32)
+    return torch.as_tensor(array, dtype=torch.float32).to(device)
 
 class Agent:
     """Agent for a Walker2DBullet environment."""
@@ -62,8 +64,10 @@ class Net(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_layer, out_features)
         )
+        self.to(device)
     
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
+        x = x.to(device)
         return self.net(x)
 
 class Policy(Net):
@@ -74,14 +78,14 @@ class Policy(Net):
             hidden_layer=NUM_HIDDEN_LAYER
         )
         self.cov_var = torch.full(size=(out_features,), fill_value=0.5)
-        self.cov_mat = torch.diag(self.cov_var)
+        self.cov_mat = torch.diag(self.cov_var).to(device)
 
     def act(self, observation: np.ndarray) -> Tuple[np.ndarray, float]:
         mean = self(to_tensor(observation).unsqueeze(0))
         dist = MultivariateNormal(mean, self.cov_mat)
         action = dist.sample()
         log_prob = dist.log_prob(action)
-        return action.squeeze(0).numpy(), log_prob.item()
+        return action.squeeze(0).cpu().numpy(), log_prob.item()
 
 class Critic(Net):
     def __init__(self, in_features: int):
