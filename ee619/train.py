@@ -69,7 +69,7 @@ def main(domain: str,
         return np.tanh(input_) * scale_action + loc_action
 
     policy = Policy(observation_shape, action_shape)
-    policy_optimizer = Adam(policy.parameters(), lr=learning_rate)
+    policy_optimizer = Adam(policy.parameters(), lr=learning_rate/5)
     critic = Critic(observation_shape)
     critic_optimizer = Adam(critic.parameters(), lr=learning_rate)
     policy.train()
@@ -90,7 +90,7 @@ def main(domain: str,
           map_action=map_action,
           num_episodes=num_episodes,
           num_episodes_per_update=4,
-          num_epochs=80,
+          num_epochs=10,
           clip=0.2,
           policy_optimizer=policy_optimizer,
           critic_optimizer=critic_optimizer,
@@ -100,7 +100,7 @@ def main(domain: str,
           test_function=test_function,
           writer=writer)
     if log:
-        torch.save(policy.state_dict(), save_path)
+        torch.save(policy.state_dict(), save_path+'/model.pth')
 
 @torch.no_grad()
 def test(domain: str,
@@ -192,10 +192,6 @@ def train(
             batch_log_probs = torch.concat(batch_log_probs)
             #normalize returns
             batch_returns_norm = (batch_returns - batch_returns.mean())/(batch_returns.std()+1e-10)
-            
-            # V, _ = evaluate(batch_obs, batch_actions, policy, critic)
-            # A = batch_returns - V.detach()
-            # A = (A - A.mean()) / (A.std() + 1e-10) #normalize trick
 
             #epoch
             for _ in range(num_epochs):
@@ -214,7 +210,7 @@ def train(
                 policy_optimizer.step()
                 
                 #critic update
-                critic_loss = nn.HuberLoss()(V, batch_returns_norm)
+                critic_loss = nn.MSELoss()(V, batch_returns_norm)
 
                 critic_optimizer.zero_grad()
                 critic_loss.backward()
