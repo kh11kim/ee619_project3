@@ -100,6 +100,7 @@ def main(domain: str,
           test_function=test_function,
           writer=writer)
     if log:
+        
         torch.save(policy.state_dict(), save_path+'/model.pth')
 
 @torch.no_grad()
@@ -296,7 +297,7 @@ def build_argument_parser() -> ArgumentParser:
     parser.add_argument('--domain', default='walker')
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--learning-rate', type=float, default=1e-3)
-    parser.add_argument('--num-episodes', type=int, default=int(5e4))
+    parser.add_argument('--num-episodes', type=int, default=int(2e4))
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--task', default='run')
     parser.add_argument('--test-every', type=int, default=1000)
