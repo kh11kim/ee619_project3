@@ -13,7 +13,7 @@ from torch.utils.tensorboard.writer import SummaryWriter
 from dm_control import suite
 from dm_control.rl.control import Environment
 
-from agent import flatten_and_concat, Policy, to_tensor, Critic
+from agent import flatten_and_concat, Policy, to_tensor, Critic, PPO
 
 
 class Trajectory(NamedTuple):
@@ -37,7 +37,10 @@ def main(domain: str,
          seed: int,
          task: str,
          test_every: int,
-         test_num: int) -> None:
+         save_every: int,
+         test_num: int,
+         load_path: Optional[str]=None
+    ) -> None:
     """Create a policy and train it using the REINFORCE algorithm.
 
     Args:
@@ -68,18 +71,25 @@ def main(domain: str,
     def map_action(input_: np.ndarray) -> np.ndarray:
         return np.tanh(input_) * scale_action + loc_action
 
-    policy = Policy(observation_shape, action_shape)
-    policy_optimizer = Adam(policy.parameters(), lr=learning_rate/5)
-    critic = Critic(observation_shape)
-    critic_optimizer = Adam(critic.parameters(), lr=learning_rate)
-    policy.train()
-    critic.train()
+    agent = PPO(
+        observation_shape, 
+        action_shape,
+        lr=learning_rate,
+        num_epochs=10,
+        clip=0.2,
+        writer=writer,
+        save_path=save_path
+    )
+    if load_path is not None:
+        agent.load(load_path)
+
+    agent.train_mode()
 
     def test_function(episode: int):
         test(domain=domain,
              episode=episode,
              map_action=map_action,
-             policy=policy,
+             policy=agent.policy,
              repeat=test_num,
              seed=seed,
              task=task,
@@ -90,18 +100,13 @@ def main(domain: str,
           map_action=map_action,
           num_episodes=num_episodes,
           num_episodes_per_update=4,
-          num_epochs=10,
-          clip=0.2,
-          policy_optimizer=policy_optimizer,
-          critic_optimizer=critic_optimizer,
-          policy=policy,
-          critic=critic,
+          agent=agent,
           test_every=test_every,
+          save_every=save_every,
           test_function=test_function,
-          writer=writer)
-    if log:
-        
-        torch.save(policy.state_dict(), save_path+'/model.pth')
+    )
+    # if log:
+    #     torch.save(policy.state_dict(), save_path+'/model.pth')
 
 @torch.no_grad()
 def test(domain: str,
@@ -146,15 +151,10 @@ def train(
     map_action: Callable[[np.ndarray], np.ndarray],
     num_episodes: int,
     num_episodes_per_update: int,
-    num_epochs: int, 
-    clip: float,
-    policy_optimizer: Adam,
-    critic_optimizer: Adam,
-    policy: Policy,
-    critic: Critic,
+    agent: PPO,
     test_every: int,
+    save_every: int,
     test_function: Callable[[int], None],
-    writer: Optional[SummaryWriter]
 ) -> None:
     """Train the policy using the PPO algorithm on the given environment.
 
@@ -179,7 +179,7 @@ def train(
         traj = rollout(
             env=env, gamma=gamma,
             map_action=map_action, 
-            policy=policy
+            policy=agent.policy
         )
         batch_obs.append(traj.observations)
         batch_actions.append(traj.actions)
@@ -187,42 +187,13 @@ def train(
         batch_log_probs.append(traj.log_probs)
 
         if episode % num_episodes_per_update == 0:
-            batch_obs = torch.concat(batch_obs)
-            batch_actions = torch.concat(batch_actions)
-            batch_returns = torch.concat(batch_returns)
-            batch_log_probs = torch.concat(batch_log_probs)
-            #normalize returns
-            batch_returns_norm = (batch_returns - batch_returns.mean())/(batch_returns.std()+1e-10)
-
-            #epoch
-            for _ in range(num_epochs):
-                V, log_probs_curr = evaluate(batch_obs, batch_actions, policy, critic)
-                V = V.squeeze()
-
-                ratios = torch.exp(log_probs_curr - batch_log_probs)
-                A = batch_returns_norm - V.detach()
-                surr1 = ratios * A
-                surr2 = torch.clamp(ratios, 1 - clip, 1 + clip) * A
-                actor_loss = (-torch.min(surr1, surr2)).mean()
-
-                #policy update
-                policy_optimizer.zero_grad()
-                actor_loss.backward(retain_graph=True)
-                policy_optimizer.step()
-                
-                #critic update
-                critic_loss = nn.MSELoss()(V, batch_returns_norm)
-
-                critic_optimizer.zero_grad()
-                critic_loss.backward()
-                critic_optimizer.step()
-
-            if writer is not None:
-                train_return = batch_returns[0].item()
-                writer.add_scalar('train/return', train_return, episode)
-                writer.add_scalar('train/policy_loss', actor_loss.item(), episode)
-                writer.add_scalar('train/critic_loss', critic_loss.item(), episode)
-
+            agent.update(
+                batch_obs,
+                batch_actions,
+                batch_returns,
+                batch_log_probs,
+                episode
+            )
             #init
             batch_obs = []
             batch_actions = []
@@ -230,16 +201,19 @@ def train(
             batch_log_probs = []
 
         if episode % test_every == test_every - 1:
-            policy.eval()
+            agent.eval_mode()
             test_function(episode)
-            policy.train()
+            agent.train_mode()
+        
+        if episode % save_every == save_every - 1:
+            agent.save(f"ep{episode+1}")
 
-def evaluate(batch_obs, batch_actions, policy:Policy, critic:Critic):
-    mean = policy(batch_obs)
-    dist = MultivariateNormal(mean, policy.cov_mat)
-    log_probs = dist.log_prob(batch_actions)
-    V = critic(batch_obs)
-    return V, log_probs
+# def evaluate(batch_obs, batch_actions, policy:Policy, critic:Critic):
+#     mean = policy(batch_obs)
+#     dist = MultivariateNormal(mean, policy.cov_mat)
+#     log_probs = dist.log_prob(batch_actions)
+#     V = critic(batch_obs)
+#     return V, log_probs
 
 def rollout(env: Environment,
             gamma: float,
@@ -297,11 +271,13 @@ def build_argument_parser() -> ArgumentParser:
     parser.add_argument('--domain', default='walker')
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--learning-rate', type=float, default=1e-3)
-    parser.add_argument('--num-episodes', type=int, default=int(2e4))
+    parser.add_argument('--num-episodes', type=int, default=int(1e4))
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--task', default='run')
     parser.add_argument('--test-every', type=int, default=1000)
+    parser.add_argument('--save-every', type=int, default=10)
     parser.add_argument('--test-num', type=int, default=10)
+    parser.add_argument('--load-path', type=str, default="tmp/run/220616_115101_PPO/ep20")
     return parser
 
 if __name__ == '__main__':

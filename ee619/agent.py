@@ -1,6 +1,6 @@
 """Agent for DMControl Walker-Run task."""
 from os.path import abspath, dirname, realpath, join
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 from dm_env import TimeStep
 import numpy as np
@@ -8,6 +8,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import MultivariateNormal
+from torch.utils.tensorboard.writer import SummaryWriter
+from datetime import datetime
+import os
 
 
 ROOT = dirname(abspath(realpath(__file__)))  # path to the ee619 directory
@@ -100,3 +103,104 @@ class Critic(Net):
             out_features=1,
             hidden_layer=NUM_HIDDEN_LAYER
         )
+
+class PPO:
+    def __init__(
+        self, 
+        observation_shape: int, 
+        action_shape: int,
+        lr: float,
+        num_epochs: int,
+        clip: float,
+        save_path: str,
+        writer: Optional[SummaryWriter]=None,
+    ):
+        self.policy = Policy(observation_shape, action_shape)
+        self.critic = Critic(observation_shape)
+        self.policy_optim = optim.Adam(
+            self.policy.parameters(), lr=lr/5)
+        self.critic_optim = optim.Adam(
+            self.critic.parameters(), lr=lr)
+        self.num_epochs = num_epochs
+        self.clip = clip
+        self.writer = writer
+        timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
+        self.save_folder = f"{save_path}/{timestamp}_PPO"
+        if not os.path.exists(self.save_folder):
+            os.makedirs(self.save_folder)
+    
+    def train_mode(self):
+        self.policy.train()
+        self.critic.train()
+    
+    def eval_mode(self):
+        self.policy.eval()
+        self.critic.eval()
+    
+    def get_value_log_probs(
+        self,
+        batch_obs, 
+        batch_actions,
+    ):
+        mean = self.policy(batch_obs)
+        dist = MultivariateNormal(mean, self.policy.cov_mat)
+        log_probs = dist.log_prob(batch_actions)
+        V = self.critic(batch_obs)
+        return V, log_probs
+    
+    def update(
+        self, 
+        batch_obs,
+        batch_actions,
+        batch_returns,
+        batch_log_probs,
+        episode
+    ):
+        batch_obs = torch.concat(batch_obs)
+        batch_actions = torch.concat(batch_actions)
+        batch_returns = torch.concat(batch_returns)
+        batch_log_probs = torch.concat(batch_log_probs)
+        #normalize returns
+        batch_returns_norm = (batch_returns - batch_returns.mean())/(batch_returns.std()+1e-10)
+    
+        #epoch
+        for _ in range(self.num_epochs):
+            V, log_probs_curr = self.get_value_log_probs(batch_obs, batch_actions)
+            V = V.squeeze()
+
+            ratios = torch.exp(log_probs_curr - batch_log_probs)
+            A = batch_returns_norm - V.detach()
+            surr1 = ratios * A
+            surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * A
+            actor_loss = (-torch.min(surr1, surr2)).mean()
+
+            #policy update
+            self.policy_optim.zero_grad()
+            actor_loss.backward(retain_graph=True)
+            self.policy_optim.step()
+            
+            #critic update
+            critic_loss = nn.MSELoss()(V, batch_returns_norm)
+
+            self.critic_optim.zero_grad()
+            critic_loss.backward()
+            self.critic_optim.step()
+        
+        if self.writer is not None:
+            train_return = batch_returns[0].item()
+            self.writer.add_scalar('train/return', train_return, episode)
+            self.writer.add_scalar('train/policy_loss', actor_loss.item(), episode)
+            self.writer.add_scalar('train/critic_loss', critic_loss.item(), episode)
+    
+    def save(self, filename):
+        save_path = self.save_folder + "/" + filename
+        torch.save(self.policy.state_dict(), save_path + "_policy.pth")
+        torch.save(self.critic.state_dict(), save_path +"_critic.pth")
+        torch.save(self.policy_optim.state_dict(), save_path +"_policy_optim.pth")
+        torch.save(self.critic_optim.state_dict(), save_path +"_critic_optim.pth")
+    
+    def load(self, filename):
+        self.critic.load_state_dict(torch.load(filename + "_critic.pth"))
+        self.critic_optim.load_state_dict(torch.load(filename + "_critic_optim.pth"))
+        self.policy.load_state_dict(torch.load(filename + "_policy.pth"))
+        self.policy_optim.load_state_dict(torch.load(filename + "_policy_optim.pth"))
